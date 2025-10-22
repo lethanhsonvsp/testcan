@@ -8,6 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="HidSharp" Version="2.6.4" />
     <PackageReference Include="SocketCANSharp" Version="0.13.0" />
   </ItemGroup>
 
