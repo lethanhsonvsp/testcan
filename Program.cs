@@ -1,4 +1,6 @@
-﻿using HidSharp;
+﻿using System;
+using System.Linq;
+using System.Threading;
 using System.Diagnostics;
 using System.Collections.Concurrent;
 using SocketCANSharp;
@@ -29,7 +31,7 @@ namespace testcan
         public TPDO1Data(byte[] data)
         {
             StatusWord = 0; ActualPosition = 0; ActualTorque = 0;
-            if (data.Length >= 2) StatusWord = (ushort)(data[0] | data[1] << 8);
+            if (data.Length >= 2) StatusWord = (ushort)(data[0] | (data[1] << 8));
             if (data.Length >= 6) ActualPosition = BitConverter.ToInt32(data, 2);
             if (data.Length >= 8) ActualTorque = BitConverter.ToInt16(data, 6);
         }
@@ -48,124 +50,6 @@ namespace testcan
                 ModesOfOperationDisplay = data[4];
             }
             else { ActualVelocity = 0; ModesOfOperationDisplay = 0; }
-        }
-    }
-    #endregion
-    #region PS5 Controller
-    public class PS5Controller
-    {
-        private HidDevice? device;
-        private HidStream? stream;
-        private volatile bool isRunning = false;
-        private const int PS5_VENDOR_ID = 0x054C;
-        private const int PS5_PRODUCT_ID = 0x0CE6;
-        public struct ControllerState
-        {
-            public byte LeftStickX;
-            public byte LeftStickY;
-            public byte RightStickX;
-            public byte RightStickY;
-            public byte L2Trigger;
-            public byte R2Trigger;
-            public bool Square;
-            public bool X;
-            public bool Circle;
-            public bool Triangle;
-            public bool L1;
-            public bool R1;
-            public bool Share;
-            public bool Options;
-            public bool PS;
-        }
-        public event Action<ControllerState>? OnControllerUpdate;
-        public bool Connect()
-        {
-            try
-            {
-                var devices = DeviceList.Local.GetHidDevices(PS5_VENDOR_ID, PS5_PRODUCT_ID);
-                device = devices.FirstOrDefault();
-                if (device == null)
-                {
-                    return false;
-                }
-                if (device.TryOpen(out stream))
-                {
-                    return true;
-                }
-                return false;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-        public void StartReading()
-        {
-            if (stream == null) return;
-            isRunning = true;
-            var readThread = new Thread(ReadControllerData) { IsBackground = true };
-            readThread.Start();
-        }
-        private void ReadControllerData()
-        {
-            byte[] buffer = new byte[64];
-            while (isRunning)
-            {
-                try
-                {
-                    int bytesRead = stream!.Read(buffer, 0, buffer.Length);
-                    if (bytesRead > 0)
-                    {
-                        var state = ParseControllerData(buffer);
-                        OnControllerUpdate?.Invoke(state);
-                    }
-                    Thread.Sleep(1);
-                }
-                catch
-                {
-                    break;
-                }
-            }
-        }
-        private static ControllerState ParseControllerData(byte[] data)
-        {
-            var state = new ControllerState();
-            if (data.Length < 10) return state;
-            byte rawLX = data[1];
-            byte rawLY = data[2];
-            byte rawRX = data[3];
-            byte rawRY = data[4];
-            state.LeftStickX = rawLX;
-            state.LeftStickY = rawLY;
-            state.RightStickX = rawRX;
-            state.RightStickY = rawRY;
-            state.LeftStickX = 127;
-            state.RightStickY = 127;
-            state.L2Trigger = data[5];
-            state.R2Trigger = data[6];
-            byte faceButtons = data[8];
-            state.Square = (faceButtons & 0x10) != 0;
-            state.X = (faceButtons & 0x20) != 0;
-            state.Circle = (faceButtons & 0x40) != 0;
-            state.Triangle = (faceButtons & 0x80) != 0;
-            if (data.Length > 9)
-            {
-                byte shoulderButtons = data[9];
-                state.L1 = (shoulderButtons & 0x01) != 0;
-                state.R1 = (shoulderButtons & 0x02) != 0;
-                state.Share = (shoulderButtons & 0x10) != 0;
-                state.Options = (shoulderButtons & 0x20) != 0;
-            }
-            if (data.Length > 10)
-            {
-                state.PS = (data[10] & 0x01) != 0;
-            }
-            return state;
-        }
-        public void Stop()
-        {
-            isRunning = false;
-            stream?.Close();
         }
     }
     #endregion
@@ -191,35 +75,44 @@ namespace testcan
         public event EventHandler<(byte nodeId, TPDO2Data data)>? TPDO2Received;
 
         public string GetInterfaceName() => canInterface;
-
         public TPDO1Data GetLatestTPDO1(byte nodeId) =>
             latestTPDO1.TryGetValue(nodeId, out var data) ? data : new TPDO1Data();
-
         public TPDO2Data GetLatestTPDO2(byte nodeId) =>
             latestTPDO2.TryGetValue(nodeId, out var data) ? data : new TPDO2Data();
+        public DateTime GetLastTPDO1Time(byte nodeId) =>
+            lastTPDO1Update.TryGetValue(nodeId, out var time) ? time : DateTime.MinValue;
+        public DateTime GetLastTPDO2Time(byte nodeId) =>
+            lastTPDO2Update.TryGetValue(nodeId, out var time) ? time : DateTime.MinValue;
 
         public bool Connect(string interfaceName, int baudrate)
         {
             try
             {
                 canInterface = interfaceName;
-                ExecuteCommand($"sudo ip link set {interfaceName} down");
-                ExecuteCommand($"sudo ip link set {interfaceName} type can bitrate {baudrate}");
-                ExecuteCommand($"sudo ip link set {interfaceName} up");
+                Console.WriteLine($"Thiết lập giao diện CAN {interfaceName} với baudrate {baudrate}");
+                string result = ExecuteCommand("sudo /usr/local/bin/setup_can.sh");
+                if (result.Contains("error", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine($"Lỗi thiết lập giao diện CAN: {result}");
+                    return false;
+                }
                 canSocket = new RawCanSocket();
                 canInterfaceHandle = CanNetworkInterface.GetAllInterfaces(true).FirstOrDefault(i => i.Name == interfaceName);
                 if (canInterfaceHandle == null)
                 {
+                    Console.WriteLine($"CAN: Interface {interfaceName} not found");
                     return false;
                 }
                 canSocket.Bind(canInterfaceHandle);
                 isConnected = true;
+                Console.WriteLine($"Kết nối thành công {interfaceName}");
                 StartCANMonitoring();
                 Thread.Sleep(200);
                 return true;
             }
-            catch
+            catch (Exception ex)
             {
+                Console.WriteLine($"Lỗi kết nối CAN: {ex.Message}");
                 return false;
             }
         }
@@ -230,19 +123,23 @@ namespace testcan
             try
             {
                 uint cobId = 0x000;
-                byte[] data = [command, targetNodeId];
-
+                byte[] data = new byte[8]; // Đảm bảo mảng 8 byte
+                data[0] = command;
+                data[1] = targetNodeId;
                 var frame = new CanFrame
                 {
                     CanId = cobId,
                     Data = data,
-                    Length = (byte)data.Length
+                    Length = 2
                 };
                 canSocket.Write(frame);
+                string frameData = BitConverter.ToString(data, 0, 2).Replace("-", "");
+                Console.WriteLine($"NMT command sent: 0x{command:X2} to node {targetNodeId}");
                 return true;
             }
-            catch
+            catch (Exception ex)
             {
+                Console.WriteLine($"Lỗi SendNMT: {ex.Message}");
                 return false;
             }
         }
@@ -253,22 +150,24 @@ namespace testcan
             try
             {
                 uint cobId = (uint)(0x300 + nodeId);
-                byte[] data = new byte[5];
+                byte[] data = new byte[8];
                 byte[] velBytes = BitConverter.GetBytes(targetVelocity);
                 Array.Copy(velBytes, 0, data, 0, 4);
                 data[4] = (byte)modesOfOperation;
-                // Fixed: Use object initializer instead of non-existent constructor
                 var frame = new CanFrame
                 {
                     CanId = cobId,
                     Data = data,
-                    Length = (byte)data.Length
+                    Length = 5
                 };
                 canSocket.Write(frame);
+                string frameData = BitConverter.ToString(data, 0, 5).Replace("-", "");
+                Console.WriteLine($"RPDO2 sent: {cobId:X3}#{frameData}");
                 return true;
             }
-            catch
+            catch (Exception ex)
             {
+                Console.WriteLine($"Lỗi SendRPDO2: {ex.Message}");
                 return false;
             }
         }
@@ -288,13 +187,15 @@ namespace testcan
                         while (canFrames.Count > MAX_QUEUE_SIZE)
                             canFrames.TryDequeue(out _);
                         canFrames.Enqueue(frame);
-                        CANFrameReceived?.Invoke(this, FrameToString(frame));
+                        string frameStr = FrameToString(frame);
+                        CANFrameReceived?.Invoke(this, frameStr);
                         ProcessPDOMessage(frame);
                         Thread.Sleep(1);
                     }
                 }
-                catch
+                catch (Exception ex)
                 {
+                    Console.WriteLine($"Lỗi monitor CAN: {ex.Message}");
                     isMonitoring = false;
                 }
             });
@@ -330,9 +231,13 @@ namespace testcan
                 {
                     canSocket?.Close();
                     canSocket?.Dispose();
+                    ExecuteCommand($"sudo ip link set {canInterface} down");
+                    Console.WriteLine($"Ngắt kết nối CAN interface {canInterface}");
                 }
-                catch { }
-                ExecuteCommand($"sudo ip link set {canInterface} down");
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Lỗi ngắt kết nối CAN: {ex.Message}");
+                }
                 isConnected = false;
             }
         }
@@ -352,7 +257,7 @@ namespace testcan
                             1 => 0x2F,
                             2 => 0x2B,
                             4 => 0x23,
-                            _ => throw new ArgumentException()
+                            _ => throw new ArgumentException($"Kích thước dữ liệu không hỗ trợ: {dataSize}")
                         };
                         byte[] frameData = new byte[8];
                         frameData[0] = command;
@@ -362,9 +267,6 @@ namespace testcan
                         byte[] dataBytes = BitConverter.GetBytes(data);
                         Array.Copy(dataBytes, 0, frameData, 4, Math.Min((int)dataSize, 4));
                         uint cobId = (uint)(0x600 + nodeId);
-                        // Replace this line in UbuntuCANInterface.WriteSDO and ReadSDO:
-                        // var frame = new CanFrame(cobId, frameData.Length, frameData);
-                        // With the following:
                         var frame = new CanFrame
                         {
                             CanId = cobId,
@@ -372,10 +274,13 @@ namespace testcan
                             Length = (byte)frameData.Length
                         };
                         canSocket.Write(frame);
+                        string frameDataStr = BitConverter.ToString(frameData, 0, frame.Length).Replace("-", "");
+                        Console.WriteLine($"SDO Write: {cobId:X3}#{frameDataStr}");
                         return WaitForSDOResponse((uint)(0x580 + nodeId), true);
                     }
-                    catch
+                    catch (Exception ex)
                     {
+                        Console.WriteLine($"Lỗi WriteSDO: {ex.Message}");
                         return false;
                     }
                 }
@@ -398,9 +303,6 @@ namespace testcan
                         frameData[2] = (byte)(index >> 8);
                         frameData[3] = subindex;
                         uint cobId = (uint)(0x600 + nodeId);
-                        // Replace this line in UbuntuCANInterface.WriteSDO and ReadSDO:
-                        // var frame = new CanFrame(cobId, frameData.Length, frameData);
-                        // With the following:
                         var frame = new CanFrame
                         {
                             CanId = cobId,
@@ -408,10 +310,13 @@ namespace testcan
                             Length = (byte)frameData.Length
                         };
                         canSocket.Write(frame);
+                        string frameDataStr = BitConverter.ToString(frameData, 0, frame.Length).Replace("-", "");
+                        Console.WriteLine($"SDO Read: {cobId:X3}#{frameDataStr}");
                         return WaitForSDOReadResponse((uint)(0x580 + nodeId));
                     }
-                    catch
+                    catch (Exception ex)
                     {
+                        Console.WriteLine($"Lỗi ReadSDO: {ex.Message}");
                         return 0;
                     }
                 }
@@ -425,7 +330,6 @@ namespace testcan
             {
                 if (canFrames.TryDequeue(out CanFrame frame))
                 {
-                    // Replace all instances of 'frame.Dlc' with 'frame.Length'
                     if (frame.CanId == expectedCOBID && frame.Length > 0)
                     {
                         try
@@ -458,8 +362,8 @@ namespace testcan
                             return responseCmd switch
                             {
                                 0x4F => frame.Data[4],
-                                0x4B => (uint)(frame.Data[4] | frame.Data[5] << 8),
-                                0x43 => (uint)(frame.Data[4] | frame.Data[5] << 8 | frame.Data[6] << 16 | frame.Data[7] << 24),
+                                0x4B => (uint)(frame.Data[4] | (frame.Data[5] << 8)),
+                                0x43 => (uint)(frame.Data[4] | (frame.Data[5] << 8) | (frame.Data[6] << 16) | (frame.Data[7] << 24)),
                                 _ => 0u
                             };
                         }
@@ -497,11 +401,13 @@ namespace testcan
                 string output = process.StandardOutput.ReadToEnd();
                 string error = process.StandardError.ReadToEnd();
                 process.WaitForExit();
-                return string.IsNullOrEmpty(error) || error.Contains("RTNETLINK") ? output : error;
+                if (!string.IsNullOrEmpty(error) && !error.Contains("RTNETLINK"))
+                    return error;
+                return output;
             }
-            catch
+            catch (Exception ex)
             {
-                return "";
+                return $"Lỗi: {ex.Message}";
             }
         }
     }
@@ -518,60 +424,82 @@ namespace testcan
         private const ushort TARGET_VELOCITY = 0x60FF;
         private const ushort VELOCITY_ACTUAL = 0x606C;
         private const double ENCODER_RES = 10000.0;
+        private const ushort POSITION_ACTUAL = 0x6064;
+        private const ushort ERROR_CODE = 0x603F;
 
+   
         public CiA402Motor(UbuntuCANInterface canInterface, byte nodeId)
         {
             this.canInterface = canInterface;
             this.nodeId = nodeId;
         }
-
-        public bool ConfigurePDO()
-        {
-            canInterface.WriteSDO(nodeId, 0x1401, 1, 0x80000300 + nodeId, 4);
-            canInterface.WriteSDO(nodeId, 0x1601, 0, 0, 1);
-            canInterface.WriteSDO(nodeId, 0x1601, 1, 0x60FF0020, 4);
-            canInterface.WriteSDO(nodeId, 0x1601, 2, 0x60600008, 4);
-            canInterface.WriteSDO(nodeId, 0x1601, 0, 2, 1);
-            canInterface.WriteSDO(nodeId, 0x1401, 1, (uint)(0x00000300 + nodeId), 4);
-            canInterface.WriteSDO(nodeId, 0x1800, 1, 0x80000180 + nodeId, 4);
-            canInterface.WriteSDO(nodeId, 0x1A00, 0, 0, 1);
-            canInterface.WriteSDO(nodeId, 0x1A00, 1, 0x60410010, 4);
-            canInterface.WriteSDO(nodeId, 0x1A00, 2, 0x60640020, 4);
-            canInterface.WriteSDO(nodeId, 0x1A00, 3, 0x60770010, 4);
-            canInterface.WriteSDO(nodeId, 0x1A00, 0, 3, 1);
-            canInterface.WriteSDO(nodeId, 0x1800, 1, (uint)(0x00000180 + nodeId), 4);
-            canInterface.WriteSDO(nodeId, 0x1801, 1, 0x80000280 + nodeId, 4);
-            canInterface.WriteSDO(nodeId, 0x1A01, 0, 0, 1);
-            canInterface.WriteSDO(nodeId, 0x1A01, 1, 0x606C0020, 4);
-            canInterface.WriteSDO(nodeId, 0x1A01, 2, 0x60610008, 4);
-            canInterface.WriteSDO(nodeId, 0x1A01, 0, 2, 1);
-            canInterface.WriteSDO(nodeId, 0x1801, 1, (uint)(0x00000280 + nodeId), 4);
-            Thread.Sleep(500);
-            usePDO = true;
-            return true;
-        }
-
         public void EnablePDOMode(bool enable)
         {
             usePDO = enable;
         }
+        public bool ConfigurePDO()
+        {
+            try
+            {
+                canInterface.WriteSDO(nodeId, 0x1401, 1, 0x80000300 + nodeId, 4);
+                canInterface.WriteSDO(nodeId, 0x1601, 0, 0, 1);
+                canInterface.WriteSDO(nodeId, 0x1601, 1, 0x60FF0020, 4);
+                canInterface.WriteSDO(nodeId, 0x1601, 2, 0x60600008, 4);
+                canInterface.WriteSDO(nodeId, 0x1601, 0, 2, 1);
+                canInterface.WriteSDO(nodeId, 0x1401, 1, (uint)(0x00000300 + nodeId), 4);
+                canInterface.WriteSDO(nodeId, 0x1800, 1, 0x80000180 + nodeId, 4);
+                canInterface.WriteSDO(nodeId, 0x1A00, 0, 0, 1);
+                canInterface.WriteSDO(nodeId, 0x1A00, 1, 0x60410010, 4);
+                canInterface.WriteSDO(nodeId, 0x1A00, 2, 0x60640020, 4);
+                canInterface.WriteSDO(nodeId, 0x1A00, 3, 0x60770010, 4);
+                canInterface.WriteSDO(nodeId, 0x1A00, 0, 3, 1);
+                canInterface.WriteSDO(nodeId, 0x1800, 1, (uint)(0x00000180 + nodeId), 4);
+                canInterface.WriteSDO(nodeId, 0x1801, 1, 0x80000280 + nodeId, 4);
+                canInterface.WriteSDO(nodeId, 0x1A01, 0, 0, 1);
+                canInterface.WriteSDO(nodeId, 0x1A01, 1, 0x606C0020, 4);
+                canInterface.WriteSDO(nodeId, 0x1A01, 2, 0x60610008, 4);
+                canInterface.WriteSDO(nodeId, 0x1A01, 0, 2, 1);
+                canInterface.WriteSDO(nodeId, 0x1801, 1, (uint)(0x00000280 + nodeId), 4);
+                Thread.Sleep(500);
+                usePDO = true;
+                Console.WriteLine($"PDO configured for node {nodeId}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Lỗi ConfigurePDO node {nodeId}: {ex.Message}");
+                return false;
+            }
+        }
 
         public bool Initialize()
         {
-            UpdateState();
-            if (currentState == CiA402State.Fault)
+            try
             {
-                ResetFault();
-                Thread.Sleep(500);
                 UpdateState();
+                if (currentState == CiA402State.Fault)
+                {
+                    ResetFault();
+                    Thread.Sleep(500);
+                    UpdateState();
+                }
+                if (!EnableOperation())
+                {
+                    Console.WriteLine($"Lỗi: Không thể kích hoạt Operation cho node {nodeId}");
+                    return false;
+                }
+                canInterface.WriteSDO(nodeId, 0x6060, 0, (byte)OperationMode.CyclicSynchronousVelocity, 1);
+                Thread.Sleep(100);
+                canInterface.WriteSDO(nodeId, TARGET_VELOCITY, 0, 0, 4);
+                Thread.Sleep(100);
+                Console.WriteLine($"Initialized motor node {nodeId}");
+                return true;
             }
-            if (!EnableOperation())
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Lỗi Initialize node {nodeId}: {ex.Message}");
                 return false;
-            canInterface.WriteSDO(nodeId, 0x6060, 0, (byte)OperationMode.CyclicSynchronousVelocity, 1);
-            Thread.Sleep(100);
-            canInterface.WriteSDO(nodeId, TARGET_VELOCITY, 0, 0, 4);
-            Thread.Sleep(100);
-            return true;
+            }
         }
 
         public bool SetVelocityRpm(double rpm)
@@ -588,9 +516,19 @@ namespace testcan
 
         public bool Disable()
         {
-            SetVelocity(0);
-            Thread.Sleep(100);
-            return canInterface.WriteSDO(nodeId, CONTROL_WORD, 0, 0x07, 2);
+            try
+            {
+                SetVelocity(0);
+                Thread.Sleep(100);
+                bool result = canInterface.WriteSDO(nodeId, CONTROL_WORD, 0, 0x07, 2);
+                Console.WriteLine($"Disabled motor node {nodeId}: {result}");
+                return result;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Lỗi Disable node {nodeId}: {ex.Message}");
+                return false;
+            }
         }
 
         private void UpdateState()
@@ -622,7 +560,17 @@ namespace testcan
 
         private bool ResetFault()
         {
-            return canInterface.WriteSDO(nodeId, CONTROL_WORD, 0, 0x80, 2);
+            try
+            {
+                bool result = canInterface.WriteSDO(nodeId, CONTROL_WORD, 0, 0x80, 2);
+                Console.WriteLine($"Reset fault node {nodeId}: {result}");
+                return result;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Lỗi ResetFault node {nodeId}: {ex.Message}");
+                return false;
+            }
         }
 
         private bool EnableOperation()
@@ -660,41 +608,89 @@ namespace testcan
 
         private bool SetVelocity(int targetVelocity)
         {
-            if (usePDO)
+            try
             {
-                return canInterface.SendRPDO2(nodeId, targetVelocity, (sbyte)OperationMode.CyclicSynchronousVelocity);
+                if (usePDO)
+                {
+                    return canInterface.SendRPDO2(nodeId, targetVelocity, (sbyte)OperationMode.CyclicSynchronousVelocity);
+                }
+                else
+                {
+                    uint velocityData = targetVelocity < 0 ?
+                        (uint)(targetVelocity + 0x100000000L) : (uint)targetVelocity;
+                    canInterface.WriteSDO(nodeId, TARGET_VELOCITY, 0, velocityData, 4);
+                    return canInterface.WriteSDO(nodeId, CONTROL_WORD, 0, 0x0F, 2);
+                }
             }
-            else
+            catch (Exception ex)
             {
-                uint velocityData = targetVelocity < 0 ?
-                    (uint)(targetVelocity + 0x100000000L) : (uint)targetVelocity;
-                canInterface.WriteSDO(nodeId, TARGET_VELOCITY, 0, velocityData, 4);
-                return canInterface.WriteSDO(nodeId, CONTROL_WORD, 0, 0x0F, 2);
+                Console.WriteLine($"Lỗi SetVelocity node {nodeId}: {ex.Message}");
+                return false;
             }
         }
 
         private int GetActualVelocity()
         {
-            if (usePDO)
+            try
             {
-                return canInterface.GetLatestTPDO2(nodeId).ActualVelocity;
+                if (usePDO)
+                {
+                    return canInterface.GetLatestTPDO2(nodeId).ActualVelocity;
+                }
+                else
+                {
+                    uint rawValue = canInterface.ReadSDO(nodeId, VELOCITY_ACTUAL, 0);
+                    return rawValue > 0x7FFFFFFF ? (int)(rawValue - 0x100000000L) : (int)rawValue;
+                }
             }
-            else
+            catch (Exception ex)
             {
-                uint rawValue = canInterface.ReadSDO(nodeId, VELOCITY_ACTUAL, 0);
-                return rawValue > 0x7FFFFFFF ? (int)(rawValue - 0x100000000L) : (int)rawValue;
+                Console.WriteLine($"Lỗi GetActualVelocity node {nodeId}: {ex.Message}");
+                return 0;
+            }
+        }
+        public int GetActualPosition()
+        {
+            try
+            {
+                if (usePDO)
+                {
+                    return canInterface.GetLatestTPDO1(nodeId).ActualPosition;
+                }
+                else
+                {
+                    uint rawValue = canInterface.ReadSDO(nodeId, POSITION_ACTUAL, 0);
+                    return unchecked((int)rawValue);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Lỗi GetActualPosition node {nodeId}: {ex.Message}");
+                return 0;
+            }
+        }
+
+        public ushort GetErrorCode()
+        {
+            try
+            {
+                uint code = canInterface.ReadSDO(nodeId, ERROR_CODE, 0);
+                return (ushort)(code & 0xFFFF);
+            }
+            catch
+            {
+                return 0;
             }
         }
     }
     #endregion
-    #region TwoWheelRobot - PDO Optimized
+    #region TwoWheelRobot - Keyboard Control
     public class TwoWheelRobot
     {
         private readonly CiA402Motor left;
         private readonly CiA402Motor right;
         private const double MAX_RPM = 1500.0;
-        private const double DEADZONE = 35.0;
-        private const double JOY_CENTER = 127.5;
+        private const double RPM_STEP = 100.0; // Tăng/giảm 100 RPM mỗi lần nhấn phím
         private volatile bool isRunning = false;
         private double lastLeftRpm = 0;
         private double lastRightRpm = 0;
@@ -718,49 +714,39 @@ namespace testcan
             SetMotorSpeeds(0, 0);
         }
 
-        public void UpdateFromController(PS5Controller.ControllerState state)
+        public void UpdateFromKeyboard(ConsoleKeyInfo keyInfo)
         {
             if (!isRunning) return;
-            if (!state.R1)
-            {
-                if (Math.Abs(lastLeftRpm) > 0.1 || Math.Abs(lastRightRpm) > 0.1)
-                {
-                    SetMotorSpeeds(0, 0);
-                }
-                return;
-            }
             var now = DateTime.Now;
             if ((now - lastUpdateTime).TotalMilliseconds < UPDATE_INTERVAL_MS) return;
             lastUpdateTime = now;
-            double forward = JOY_CENTER - state.LeftStickY;
-            double turn = state.RightStickX - JOY_CENTER;
-            if (Math.Abs(forward) < DEADZONE) forward = 0;
-            if (Math.Abs(turn) < DEADZONE) turn = 0;
-            forward = Math.Max(-1.0, Math.Min(1.0, forward / JOY_CENTER));
-            turn = Math.Max(-1.0, Math.Min(1.0, turn / JOY_CENTER));
-            double leftSpeed, rightSpeed;
-            if (Math.Abs(forward) >= Math.Abs(turn))
+
+            double speedChange = 0;
+            switch (keyInfo.Key)
             {
-                leftSpeed = forward;
-                rightSpeed = forward;
+                case ConsoleKey.UpArrow:
+                    speedChange = RPM_STEP; // Tăng tốc tiến
+                    break;
+                case ConsoleKey.DownArrow:
+                    speedChange = -RPM_STEP; // Tăng tốc lùi
+                    break;
+                case ConsoleKey.Spacebar:
+                    speedChange = 0; // Dừng
+                    SetMotorSpeeds(0, 0);
+                    return;
+                default:
+                    return; // Bỏ qua các phím khác
             }
-            else
-            {
-                leftSpeed = turn;
-                rightSpeed = -turn;
-            }
-            leftSpeed = Math.Max(-1.0, Math.Min(1.0, leftSpeed));
-            rightSpeed = Math.Max(-1.0, Math.Min(1.0, rightSpeed));
-            double leftRpm = leftSpeed * MAX_RPM;
-            double rightRpm = rightSpeed * MAX_RPM;
-            SetMotorSpeeds(leftRpm, rightRpm);
+
+            double newRpm = Math.Max(-MAX_RPM, Math.Min(MAX_RPM, lastLeftRpm + speedChange));
+            SetMotorSpeeds(newRpm, newRpm); // Cả hai động cơ cùng tốc độ
         }
 
         private void SetMotorSpeeds(double leftRpm, double rightRpm)
         {
             if (Math.Abs(leftRpm - lastLeftRpm) > 0.5)
             {
-                left.SetVelocityRpm(leftRpm);
+                left.SetVelocityRpm(-leftRpm);
                 lastLeftRpm = leftRpm;
             }
             if (Math.Abs(rightRpm - lastRightRpm) > 0.5)
@@ -768,14 +754,26 @@ namespace testcan
                 right.SetVelocityRpm(rightRpm);
                 lastRightRpm = rightRpm;
             }
+            Console.WriteLine($"Set speeds: Left={leftRpm:F1} RPM, Right={rightRpm:F1} RPM");
         }
 
         public string GetStatusString()
         {
             double leftVel = left.GetActualVelocityRpm();
             double rightVel = right.GetActualVelocityRpm();
-            return $"L: {leftVel,6:F1} | R: {rightVel,6:F1}";
+            int leftPos = left.GetActualPosition();
+            int rightPos = right.GetActualPosition();
+
+            ushort leftErr = left.GetErrorCode();
+            ushort rightErr = right.GetErrorCode();
+
+            string errStr = (leftErr != 0 || rightErr != 0)
+                ? $" | ERR L:{leftErr:X4} R:{rightErr:X4}"
+                : "";
+
+            return $"L:{leftVel,6:F1}rpm P:{leftPos,8} | R:{rightVel,6:F1}rpm P:{rightPos,8}{errStr}";
         }
+
 
         public (double left, double right) GetTargetSpeeds()
         {
@@ -788,90 +786,98 @@ namespace testcan
     {
         static void Main(string[] args)
         {
-            ArgumentNullException.ThrowIfNull(args);
-            string canInterface = "can0";
+            // Cấu hình terminal để đọc phím không cần nhấn Enter
+            ConfigureConsole();
+
+            string canInterface = "can1";
             int baudrate = 500000;
             byte leftNodeId = 1;
             byte rightNodeId = 2;
+
             var sharedCANInterface = new UbuntuCANInterface();
             try
             {
                 if (!sharedCANInterface.Connect(canInterface, baudrate))
                 {
+                    Console.WriteLine("Không thể kết nối CAN interface");
                     return;
                 }
+
                 sharedCANInterface.SendNMT(0x81, leftNodeId);
                 sharedCANInterface.SendNMT(0x81, rightNodeId);
                 Thread.Sleep(1000);
                 sharedCANInterface.SendNMT(0x01, leftNodeId);
                 sharedCANInterface.SendNMT(0x01, rightNodeId);
                 Thread.Sleep(500);
+
                 var leftMotor = new CiA402Motor(sharedCANInterface, leftNodeId);
                 if (!leftMotor.Initialize())
                 {
+                    Console.WriteLine("Không thể khởi tạo động cơ trái");
                     return;
                 }
                 if (!leftMotor.ConfigurePDO())
                 {
+                    Console.WriteLine("Không thể cấu hình PDO cho động cơ trái");
                     return;
                 }
                 leftMotor.EnablePDOMode(true);
+
                 var rightMotor = new CiA402Motor(sharedCANInterface, rightNodeId);
                 if (!rightMotor.Initialize())
                 {
+                    Console.WriteLine("Không thể khởi tạo động cơ phải");
                     return;
                 }
                 if (!rightMotor.ConfigurePDO())
                 {
+                    Console.WriteLine("Không thể cấu hình PDO cho động cơ phải");
                     return;
                 }
                 rightMotor.EnablePDOMode(true);
-                var ps5Controller = new PS5Controller();
-                if (!ps5Controller.Connect())
-                {
-                    return;
-                }
+
                 var robot = new TwoWheelRobot(leftMotor, rightMotor);
                 robot.Start();
-                ps5Controller.OnControllerUpdate += (state) =>
-                {
-                    try
-                    {
-                        robot.UpdateFromController(state);
-                        if (state.PS)
-                        {
-                            robot.Stop();
-                            Thread.Sleep(500);
-                            leftMotor.Disable();
-                            rightMotor.Disable();
-                            sharedCANInterface.Disconnect();
-                            Environment.Exit(0);
-                        }
-                    }
-                    catch { }
-                };
-                ps5Controller.StartReading();
+
+                // Thread hiển thị trạng thái
                 var statusThread = new Thread(() =>
                 {
                     while (true)
                     {
                         try
                         {
-                            robot.GetStatusString();
+                            Console.WriteLine(robot.GetStatusString());
                             Thread.Sleep(500);
                         }
-                        catch { }
+                        catch { break; }
                     }
                 })
                 { IsBackground = true };
                 statusThread.Start();
+
+                // Đọc bàn phím
                 while (true)
                 {
-                    Thread.Sleep(100);
+                    if (Console.KeyAvailable)
+                    {
+                        var keyInfo = Console.ReadKey(true);
+                        if (keyInfo.Key == ConsoleKey.Q || keyInfo.Key == ConsoleKey.Escape)
+                        {
+                            robot.Stop();
+                            Thread.Sleep(500);
+                            leftMotor.Disable();
+                            rightMotor.Disable();
+                            sharedCANInterface.Disconnect();
+                            break;
+                        }
+                        robot.UpdateFromKeyboard(keyInfo);
+                    }
+                    Thread.Sleep(10);
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                Console.WriteLine($"Lỗi chương trình: {ex.Message}");
             }
             finally
             {
@@ -880,6 +886,60 @@ namespace testcan
                     sharedCANInterface?.Disconnect();
                 }
                 catch { }
+                RestoreConsole();
+            }
+        }
+
+        private static void ConfigureConsole()
+        {
+            try
+            {
+                // Tắt chế độ echo và canonical để đọc phím trực tiếp
+                ExecuteCommand("stty -echo -icanon");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Lỗi cấu hình console: {ex.Message}");
+            }
+        }
+
+        private static void RestoreConsole()
+        {
+            try
+            {
+                // Khôi phục chế độ terminal
+                ExecuteCommand("stty echo icanon");
+            }
+            catch { }
+        }
+
+        private static string ExecuteCommand(string command)
+        {
+            try
+            {
+                var process = new Process
+                {
+                    StartInfo = new ProcessStartInfo
+                    {
+                        FileName = "/bin/bash",
+                        Arguments = $"-c \"{command}\"",
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true
+                    }
+                };
+                process.Start();
+                string output = process.StandardOutput.ReadToEnd();
+                string error = process.StandardError.ReadToEnd();
+                process.WaitForExit();
+                if (!string.IsNullOrEmpty(error) && !error.Contains("RTNETLINK"))
+                    return error;
+                return output;
+            }
+            catch (Exception ex)
+            {
+                return $"Lỗi: {ex.Message}";
             }
         }
     }
